@@ -255,6 +255,53 @@ class QtDriver(DriverMixin, QObject):
 
         Translations.change_language(self.settings.language)
 
+    def record_tag_usage(self, tag_id: int, max_size: int = 20) -> None:
+        """Record a tag id in the recent-tags MRU stored in QSettings.
+
+        Stores a simple comma-separated list under the key `recent_tags`.
+        New entries are pushed to the front; duplicates are moved to front.
+        """
+        key = "recent_tags"
+        try:
+            val = self.cached_values.value(key, "")
+            ids: list[int] = []
+            if isinstance(val, str) and val.strip():
+                ids = [int(x) for x in val.split(",") if x]
+            elif isinstance(val, (list, tuple)):
+                ids = [int(x) for x in val]
+
+            if tag_id in ids:
+                ids.remove(tag_id)
+            ids.insert(0, tag_id)
+            ids = ids[:max_size]
+            self.cached_values.setValue(key, ",".join(str(x) for x in ids))
+            try:
+                # Sync to disk when possible
+                self.cached_values.sync()
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("[QtDriver] record_tag_usage failed")
+
+    def get_recent_tags(self, limit: int = 8) -> list[int]:
+        """Return a list of recent tag ids (most-recent first).
+
+        Reads from QSettings `recent_tags` key stored as comma-separated ids.
+        """
+        key = "recent_tags"
+        val = self.cached_values.value(key, "")
+        ids: list[int] = []
+        try:
+            if isinstance(val, str) and val.strip():
+                ids = [int(x) for x in val.split(",") if x]
+            elif isinstance(val, (list, tuple)):
+                ids = [int(x) for x in val]
+        except Exception:
+            logger.exception("[QtDriver] get_recent_tags failed to parse stored value")
+            ids = []
+
+        return ids[:limit]
+
     @property
     def selected(self) -> list[int]:
         return list(self.main_window.thumb_layout._selected.keys())
@@ -876,6 +923,15 @@ class QtDriver(DriverMixin, QObject):
         self.main_window.thumb_layout.add_tags(selected, tag_ids)
         self.lib.add_tags_to_entries(selected, tag_ids)
         self.emit_badge_signals(tag_ids)
+        # Record MRU usage for tags added via the driver callback
+        try:
+            for t in tag_ids:
+                try:
+                    self.record_tag_usage(int(t))
+                except Exception:
+                    logger.exception("Failed to record tag usage", tag=t)
+        except Exception:
+            logger.exception("add_tags_to_selected_callback: failed to record recent tags")
 
     def delete_files_callback(self, origin_path: str | Path, origin_id: int | None = None):
         """Callback to send on or more files to the system trash.
@@ -1244,6 +1300,16 @@ class QtDriver(DriverMixin, QObject):
                 if not exists:
                     self.lib.add_field_to_entry(id, field_id=field.type_key, value=field.value)
             self.lib.add_tags_to_entries(id, self.copy_buffer["tags"])
+            # record MRU for pasted tags
+            try:
+                if hasattr(self, "record_tag_usage"):
+                    for t in self.copy_buffer["tags"]:
+                        try:
+                            self.record_tag_usage(int(t))
+                        except Exception:
+                            logger.exception("Failed to record pasted tag usage", tag=t)
+            except Exception:
+                logger.exception("paste_fields_action_callback: failed to record recent tags")
         if len(self.selected) > 1:
             if TAG_ARCHIVED in self.copy_buffer["tags"]:
                 self.update_badges({BadgeType.ARCHIVED: True}, origin_id=0, add_tags=False)
@@ -1437,6 +1503,15 @@ class QtDriver(DriverMixin, QObject):
             if value:
                 self.main_window.thumb_layout.add_tags(entry_ids, tag_ids)
                 self.lib.add_tags_to_entries(entry_ids, tag_ids)
+                # record MRU usage for badge tags added programmatically
+                try:
+                    for t in tag_ids:
+                        try:
+                            self.record_tag_usage(int(t))
+                        except Exception:
+                            logger.exception("Failed to record tag usage for badge tag", tag=t)
+                except Exception:
+                    logger.exception("update_badges: failed to record recent badge tags")
             else:
                 self.main_window.thumb_layout.remove_tags(entry_ids, tag_ids)
                 self.lib.remove_tags_from_entries(entry_ids, tag_ids)

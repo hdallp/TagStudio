@@ -239,6 +239,16 @@ class FieldContainers(QWidget):
             tag_ids=tags,
         )
         self.driver.emit_badge_signals(tags, emit_on_absent=False)
+        # Record MRU usage for tags added via the FieldContainers UI
+        try:
+            if hasattr(self.driver, "record_tag_usage"):
+                for t in tags:
+                    try:
+                        self.driver.record_tag_usage(int(t))
+                    except Exception:
+                        logger.exception("Failed to record tag usage for tag", tag=t)
+        except Exception:
+            logger.exception("Failed to record recent tag usages from FieldContainers")
 
     def write_container(self, index: int, field: BaseField, is_mixed: bool = False):
         """Update/Create data for a FieldContainer.

@@ -10,9 +10,12 @@ from typing import TYPE_CHECKING, override
 
 import structlog
 from PIL import Image, ImageQt
-from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QUrl
+from PySide6.QtCore import QEvent, QMimeData, QSize, Qt, QUrl, QSettings
 from PySide6.QtGui import QAction, QDrag, QEnterEvent, QGuiApplication, QMouseEvent, QPixmap
 from PySide6.QtWidgets import QBoxLayout, QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+
+from tagstudio.qt.models.palette import ColorType, UiColor, get_ui_color
+from tagstudio.qt.mixed.middle_click_overlay import MiddleClickOverlay
 
 from tagstudio.core.constants import TAG_ARCHIVED, TAG_FAVORITE
 from tagstudio.core.library.alchemy.enums import ItemType
@@ -218,6 +221,12 @@ class ItemThumb(FlowWidget):
         self.thumb_button.addAction(open_file_action)
         self.thumb_button.addAction(open_explorer_action)
         self.thumb_button.addAction(self.delete_action)
+        # Install an event filter so we can handle middle-clicks on the thumb button
+        # without interfering with the existing left-click / context menu behavior.
+        self.thumb_button.installEventFilter(self)
+
+        # transient overlay reference to keep it alive while shown
+        self._middle_click_overlay = None
 
         # Static Badges ========================================================
 
@@ -503,6 +512,387 @@ class ItemThumb(FlowWidget):
                 )
             else:
                 pass
+
+    @override
+    def eventFilter(self, obj, event):
+        """Catch middle mouse button presses on the internal `thumb_button`.
+
+        Returns True if the event was handled (prevents further processing), otherwise
+        falls back to the default behavior.
+        """
+        from PySide6.QtCore import QEvent
+
+        # Only handle events for our thumb button and only mouse press events
+        if obj is self.thumb_button and event.type() == QEvent.Type.MouseButtonPress:
+            try:
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    # Call the user-visible handler for middle clicks
+                    handled = self.on_middle_click(event)
+                    return bool(handled)
+            except Exception:
+                # If anything goes wrong, don't swallow the event — let Qt handle it
+                return False
+
+        return super().eventFilter(obj, event)
+
+    def on_middle_click(self, event):
+        """Show a small, native QMenu populated with most-recent tags and a search action.
+
+        Selecting a recent tag will add that tag to the clicked entry and record
+        the usage in the driver's MRU.
+        """
+        try:
+            logger.info("[ItemThumb] Middle-click menu", item_id=self.item_id)
+
+            # Check enabled setting (QSettings or driver.cached_values)
+            enabled = True
+            try:
+                s = QSettings()
+                enabled = bool(s.value("middle_click_enabled", True, type=bool))
+            except Exception:
+                enabled = True
+            try:
+                if hasattr(self.driver, "cached_values"):
+                    c = self.driver.cached_values.value("middle_click_enabled", None)
+                    if c is not None:
+                        enabled = bool(c)
+            except Exception:
+                pass
+
+            if not enabled:
+                # Not handled by plugin, allow default Qt behavior
+                return False
+
+            # Also select the item on middle-click, same behaviour as left-click
+            try:
+                self.driver.toggle_item_selection(
+                    self.item_id,
+                    append=(QGuiApplication.keyboardModifiers() == Qt.KeyboardModifier.ControlModifier),
+                    bridge=(QGuiApplication.keyboardModifiers() == Qt.KeyboardModifier.ShiftModifier),
+                )
+            except Exception:
+                logger.exception("[ItemThumb] middle-click selection failed")
+
+            # Determine whether to apply to all selected items based on settings + modifiers
+            try:
+                s = QSettings()
+                cfg_apply = bool(s.value("middle_click_apply_to_selected", True, type=bool))
+                cfg_ctrl = bool(s.value("middle_click_mod_ctrl", True, type=bool))
+                cfg_shift = bool(s.value("middle_click_mod_shift", True, type=bool))
+            except Exception:
+                cfg_apply = True
+                cfg_ctrl = True
+                cfg_shift = True
+
+            mods = QGuiApplication.keyboardModifiers()
+            have_ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+            have_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            apply_to_selected = False
+            if cfg_apply:
+                if cfg_ctrl and have_ctrl:
+                    apply_to_selected = True
+                if cfg_shift and have_shift:
+                    apply_to_selected = True
+
+            # Limit is configurable via QSettings key `middle_click_limit` or driver.cached_values
+            recent_tag_ids = []
+            limit = 6
+            try:
+                s = QSettings()
+                val = s.value("middle_click_limit", None)
+                if val is not None:
+                    limit = int(val)
+            except Exception:
+                pass
+            try:
+                if hasattr(self.driver, "cached_values"):
+                    cval = self.driver.cached_values.value("middle_click_limit", None)
+                    if cval is not None:
+                        limit = int(cval)
+            except Exception:
+                pass
+            if hasattr(self.driver, "get_recent_tags"):
+                # request up to `limit` recent tags
+                recent_tag_ids = self.driver.get_recent_tags(limit)
+
+            logger.info("[ItemThumb] recent_tag_ids", recent_tag_ids=recent_tag_ids)
+
+            tag_objs: list = []
+            # Build initial set from recent_tag_ids
+            existing_tag_ids: set[int] = set()
+            if not apply_to_selected:
+                try:
+                    entry_full = None
+                    if self.item_id and hasattr(self.lib, "get_entry_full"):
+                        entry_full = self.lib.get_entry_full(self.item_id, with_fields=False, with_tags=True)
+                    if entry_full and getattr(entry_full, "tags", None):
+                        existing_tag_ids = {t.id for t in entry_full.tags}
+                except Exception:
+                    existing_tag_ids = set()
+
+            seen: set[int] = set()
+            # add recent tags first (keep order)
+            for tid in recent_tag_ids:
+                if tid in seen:
+                    continue
+                t = self.lib.get_tag(tid)
+                if not t:
+                    continue
+                # If we're applying to all selected entries, don't hide tags already present
+                if not apply_to_selected and t.id in existing_tag_ids:
+                    continue
+                tag_objs.append((tid, t))
+                seen.add(tid)
+
+            # If we still need more, fetch additional tags from library search and append
+            try:
+                if len(tag_objs) < limit:
+                    # request a larger result set and fill until we reach `limit`
+                    search_res = self.lib.search_tags(None, limit=limit * 2)
+                    direct = []
+                    if isinstance(search_res, list) and len(search_res) > 0:
+                        direct = list(search_res[0])
+                    for t in direct:
+                        if len(tag_objs) >= limit:
+                            break
+                        if not t:
+                            continue
+                        if t.id in seen:
+                            continue
+                        if not apply_to_selected and t.id in existing_tag_ids:
+                            continue
+                        tag_objs.append((t.id, t))
+                        seen.add(t.id)
+            except Exception:
+                logger.exception("[ItemThumb] failed to fetch fallback tags via search_tags")
+
+            # Build overlay options from tag_objs (recent or fallback) and always try overlay
+            try:
+                overlay_opts = []
+                # provide up to `limit` recent/fallback tags
+                # Snapshot targets now so callbacks apply to the intended set
+                if apply_to_selected:
+                    targets_snapshot = list(self.driver.selected)
+                else:
+                    targets_snapshot = [self.item_id]
+
+                for tid, tag in tag_objs[:limit]:
+                    if apply_to_selected:
+                        targets = list(targets_snapshot)
+                        cb = (lambda t=tid, targets=targets: self._add_tag_and_record_multi(t, targets))
+                    else:
+                        cb = (lambda t=tid: self._add_tag_and_record(t))
+                    # pass the Tag object as metadata so overlay can style it
+                    overlay_opts.append((tag.name, cb, tag))
+
+                # Only include tag options (no search action). Limit already enforced above.
+
+                overlay = MiddleClickOverlay(parent=self.driver.main_window, options=overlay_opts)
+                # apply animation settings from QSettings / driver.cached_values so preview/out works
+                try:
+                    s = QSettings()
+                    in_enabled = bool(s.value("middle_click_anim_in_enabled", True, type=bool))
+                    in_dur = float(s.value("middle_click_anim_in_duration", 0.35, type=float))
+                    out_enabled = bool(s.value("middle_click_anim_out_enabled", True, type=bool))
+                    out_dur = float(s.value("middle_click_anim_out_duration", 0.12, type=float))
+                except Exception:
+                    in_enabled, in_dur, out_enabled, out_dur = True, 0.35, True, 0.12
+                try:
+                    if hasattr(self.driver, "cached_values"):
+                        cv = self.driver.cached_values
+                        c_in_enabled = cv.value("middle_click_anim_in_enabled", None)
+                        if c_in_enabled is not None:
+                            in_enabled = bool(c_in_enabled)
+                        c_in_dur = cv.value("middle_click_anim_in_duration", None)
+                        if c_in_dur is not None:
+                            in_dur = float(c_in_dur)
+                        c_out_enabled = cv.value("middle_click_anim_out_enabled", None)
+                        if c_out_enabled is not None:
+                            out_enabled = bool(c_out_enabled)
+                        c_out_dur = cv.value("middle_click_anim_out_duration", None)
+                        if c_out_dur is not None:
+                            out_dur = float(c_out_dur)
+                except Exception:
+                    pass
+                try:
+                    overlay.anim_in_duration = in_dur
+                    overlay.anim_out_duration = out_dur
+                    overlay.anim_enabled = bool(in_enabled)
+                    overlay.anim_out_enabled = bool(out_enabled)
+                except Exception:
+                    pass
+                # keep reference so it doesn't get GC'd
+                self._middle_click_overlay = overlay
+                global_pos = self.thumb_button.mapToGlobal(self.thumb_button.rect().center())
+                logger.info("[ItemThumb] showing overlay", at=(global_pos.x(), global_pos.y()), options=len(overlay_opts))
+                overlay.show_at(global_pos)
+                return True
+            except Exception:
+                logger.exception("Middle-click overlay failed, falling back to native menu")
+
+            # Fallback: native QMenu
+            try:
+                from PySide6.QtWidgets import QMenu
+
+                menu = QMenu(self.thumb_button)
+
+                # Populate recent tags
+                for tag_id in recent_tag_ids:
+                    tag = self.lib.get_tag(tag_id)
+                    if not tag:
+                        continue
+                    act = menu.addAction(tag.name)
+                    act.triggered.connect(lambda checked=False, t=tag_id: self._add_tag_and_record(t))
+
+                # no extra actions; only recent/fallback tags are shown
+
+                # Style menu using app palette / theme colors
+                try:
+                    dark = QGuiApplication.styleHints().colorScheme() is Qt.ColorScheme.Dark
+                    ui_color = UiColor.THEME_DARK if dark else UiColor.THEME_LIGHT
+                    bg = get_ui_color(ColorType.PRIMARY, ui_color)
+                    fg = get_ui_color(ColorType.LIGHT_ACCENT, ui_color)
+                    sel = get_ui_color(ColorType.DARK_ACCENT, ui_color)
+                    menu.setStyleSheet(
+                        f"QMenu {{ background-color: {bg}; color: {fg}; }}"
+                        f" QMenu::item:selected {{ background-color: {sel}; }}"
+                    )
+                except Exception:
+                    pass
+
+                global_pos = self.thumb_button.mapToGlobal(self.thumb_button.rect().center())
+                menu.exec(global_pos)
+                return True
+            except Exception:
+                logger.exception("on_middle_click fallback QMenu failed")
+        except Exception:
+            logger.exception("on_middle_click failed")
+            return False
+
+        return False
+
+    def _add_tag_and_record(self, tag_id: int) -> None:
+        """Helper to add a tag to this entry and record it in MRU."""
+        try:
+            if self.item_id is None or self.item_id == -1:
+                return
+
+            # Update UI first so the user sees immediate feedback
+            try:
+                self.driver.main_window.thumb_layout.add_tags([self.item_id], [tag_id])
+            except Exception:
+                logger.debug("thumb_layout.add_tags failed; continuing to add in DB")
+
+            # Persist tag addition
+            try:
+                self.lib.add_tags_to_entries(self.item_id, tag_id)
+            except Exception:
+                logger.exception("Failed to add tag to entry in library")
+
+            # Record usage in MRU
+            if hasattr(self.driver, "record_tag_usage"):
+                try:
+                    self.driver.record_tag_usage(tag_id)
+                except Exception:
+                    logger.exception("record_tag_usage failed")
+
+            # Update preview/selection state if needed
+            try:
+                if self.item_id in self.driver.selected:
+                    self.driver.main_window.preview_panel.set_selection(self.driver.selected)
+            except Exception:
+                pass
+            # Emit badge signals and update badge UI when relevant
+            try:
+                if hasattr(self.driver, "emit_badge_signals"):
+                    try:
+                        self.driver.emit_badge_signals({tag_id}, emit_on_absent=False)
+                    except Exception:
+                        logger.exception("emit_badge_signals failed")
+
+                # If this tag is a known badge (favorite/archived), update ItemThumb badges
+                if tag_id in (TAG_FAVORITE, TAG_ARCHIVED):
+                    try:
+                        badge_map = {}
+                        if tag_id == TAG_FAVORITE:
+                            badge_map[BadgeType.FAVORITE] = True
+                        elif tag_id == TAG_ARCHIVED:
+                            badge_map[BadgeType.ARCHIVED] = True
+                        # update_badges will assign visuals; set add_tags=False to avoid re-adding in DB
+                        if hasattr(self.driver, "update_badges"):
+                            self.driver.update_badges(badge_map, origin_id=self.item_id, add_tags=False)
+                    except Exception:
+                        logger.exception("update_badges for badge tag failed")
+            except Exception:
+                logger.exception("post-tag-add notifications failed")
+        except Exception:
+            logger.exception("_add_tag_and_record failed")
+
+    def _add_tag_and_record_multi(self, tag_id: int, targets: list[int]) -> None:
+        """Add a tag to multiple entries and record it in MRU."""
+        try:
+            if not targets:
+                return
+
+            # Update UI first so the user sees immediate feedback
+            try:
+                for entry_id in targets:
+                    try:
+                        self.driver.main_window.thumb_layout.add_tags([entry_id], [tag_id])
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug("thumb_layout.add_tags (multi) failed; continuing to add in DB")
+
+            # Persist tag addition for each target
+            try:
+                for entry_id in targets:
+                    try:
+                        self.lib.add_tags_to_entries(entry_id, tag_id)
+                    except Exception:
+                        logger.exception("Failed to add tag to entry in library (multi)")
+            except Exception:
+                logger.exception("Failed bulk add_tags_to_entries")
+
+            # Record usage in MRU (once per tag)
+            if hasattr(self.driver, "record_tag_usage"):
+                try:
+                    self.driver.record_tag_usage(tag_id)
+                except Exception:
+                    logger.exception("record_tag_usage failed")
+
+            # Update preview/selection state if needed
+            try:
+                if any(entry_id in self.driver.selected for entry_id in targets):
+                    self.driver.main_window.preview_panel.set_selection(self.driver.selected)
+            except Exception:
+                pass
+
+            # Emit badge signals and update badge UI when relevant
+            try:
+                if hasattr(self.driver, "emit_badge_signals"):
+                    try:
+                        self.driver.emit_badge_signals({tag_id}, emit_on_absent=False)
+                    except Exception:
+                        logger.exception("emit_badge_signals failed")
+
+                # If this tag is a known badge (favorite/archived), update ItemThumb badges
+                if tag_id in (TAG_FAVORITE, TAG_ARCHIVED):
+                    try:
+                        badge_map = {}
+                        if tag_id == TAG_FAVORITE:
+                            badge_map[BadgeType.FAVORITE] = True
+                        elif tag_id == TAG_ARCHIVED:
+                            badge_map[BadgeType.ARCHIVED] = True
+                        if hasattr(self.driver, "update_badges"):
+                            # origin_id is None since this is multi-target
+                            self.driver.update_badges(badge_map, origin_id=None, add_tags=False)
+                    except Exception:
+                        logger.exception("update_badges for badge tag failed (multi)")
+            except Exception:
+                logger.exception("post-tag-add notifications failed (multi)")
+        except Exception:
+            logger.exception("_add_tag_and_record_multi failed")
 
     @override
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[misc]

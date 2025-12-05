@@ -48,6 +48,7 @@ from tagstudio.qt.platform_strings import trash_term
 from tagstudio.qt.resource_manager import ResourceManager
 from tagstudio.qt.thumb_grid_layout import ThumbGridLayout
 from tagstudio.qt.translations import Translations
+from tagstudio.qt.mixed.middle_click_settings import MiddleClickSettingsDialog
 
 # Only import for type checking/autocompletion, will not be imported at runtime.
 if typing.TYPE_CHECKING:
@@ -102,8 +103,34 @@ class MainMenuBar(QMenuBar):
         self.setup_edit_menu()
         self.setup_view_menu()
         self.setup_tools_menu()
+        self.setup_plugins_menu()
         self.setup_macros_menu()
         self.setup_help_menu()
+
+    def setup_plugins_menu(self):
+        try:
+            plugins_label = Translations["menu.plugins"]
+        except Exception:
+            plugins_label = "Plugins"
+
+        # Middle Click settings
+        try:
+            middle_label = Translations["menu.plugins.middle_click"]
+        except Exception:
+            middle_label = "Middle Click"
+
+        try:
+            middle_tooltip = Translations["menu.plugins.middle_click_tooltip"]
+        except Exception:
+            middle_tooltip = "Configure middle-click plugin"
+
+        self.plugins_menu = QMenu(plugins_label, self)
+        self.middle_click_action = QAction(middle_label, self)
+        self.middle_click_action.setToolTip(middle_tooltip)
+        self.plugins_menu.addAction(self.middle_click_action)
+        assign_mnemonics(self.plugins_menu)
+        self.addMenu(self.plugins_menu)
+        # connect opening dialog will be done by MainWindow after menu bar instantiation
 
     def setup_file_menu(self):
         self.file_menu = QMenu(Translations["menu.file"], self)
@@ -519,6 +546,19 @@ class MainWindow(QMainWindow):
 
         self.setMenuBar(self.menu_bar)
         self.menu_bar.setNativeMenuBar(True)
+        # Connect plugin actions
+        try:
+            self.menu_bar.middle_click_action.triggered.connect(self.open_middle_click_settings)
+        except Exception:
+            # If the action isn't present for some reason, ignore
+            pass
+
+    def open_middle_click_settings(self):
+        try:
+            dlg = MiddleClickSettingsDialog(self)
+            dlg.exec()
+        except Exception:
+            logger.exception("Failed to open Middle Click settings dialog")
 
     # endregion
 
